@@ -1,0 +1,263 @@
+name: odrfid-io-packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odrfid-io-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+    steps:
+      - name: Determine package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Release tag must have the form vX.Y.Z" >&2
+              exit 1
+            fi
+            version=${GITHUB_REF_NAME#v}
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
+          echo "app_version=$version" >> "$GITHUB_OUTPUT"
+          echo "### odrfid-io $version" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Test source
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            gcc libx11-dev libxtst-dev xauth xvfb
+      - name: Run tests and vet
+        shell: bash
+        run: |
+          set -euo pipefail
+          xvfb-run -a go test ./...
+          go vet ./...
+
+  build-linux:
+    name: Linux x86-64 tarball
+    needs: [metadata, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      APP_VERSION: ${{ needs.metadata.outputs.app_version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            gcc libx11-dev libxtst-dev xauth xvfb
+      - name: Build Linux package
+        shell: bash
+        run: xvfb-run -a bash ./scripts/package-linux.sh
+      - name: Verify Linux checksum
+        shell: bash
+        working-directory: dist/linux
+        run: sha256sum --check --strict *.sha256
+      - name: Upload Linux package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: odrfid-io-linux-x86_64
+          path: dist/linux/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    name: Windows x86-64 ZIP
+    needs: [metadata, test]
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      APP_VERSION: ${{ needs.metadata.outputs.app_version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Configure MinGW-w64
+        shell: pwsh
+        run: |
+          $Candidates = @(
+            'C:\mingw64\bin',
+            'C:\tools\mingw64\bin',
+            'C:\ProgramData\mingw64\mingw64\bin',
+            'C:\msys64\mingw64\bin',
+            'C:\msys64\ucrt64\bin'
+          )
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            foreach ($Candidate in $Candidates) {
+              if (Test-Path -LiteralPath (Join-Path $Candidate 'gcc.exe')) {
+                $Candidate | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                $env:Path = "$Candidate;$env:Path"
+                break
+              }
+            }
+          }
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            throw 'MinGW-w64 gcc was not found on the Windows runner'
+          }
+          $Target = (& gcc -dumpmachine | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $Target -notmatch '^(x86_64|amd64).*(mingw|windows)') {
+            throw "Unexpected gcc target: $Target"
+          }
+      - name: Build Windows package
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Verify Windows checksum
+        shell: pwsh
+        working-directory: dist/windows
+        run: |
+          $Files = @(Get-ChildItem -File -Filter *.sha256)
+          if ($Files.Count -ne 1) { throw "Expected one checksum file, found $($Files.Count)" }
+          $Line = (Get-Content -Raw -LiteralPath $Files[0].FullName).Trim()
+          if ($Line -cnotmatch '^([0-9a-f]{64})  (.+)$') { throw 'Invalid checksum format' }
+          $Expected = $Matches[1]
+          $Package = $Matches[2]
+          $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Package).Hash.ToLowerInvariant()
+          if ($Expected -ne $Actual) { throw "Checksum mismatch: $Package" }
+      - name: Upload Windows package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: odrfid-io-windows-x86_64
+          path: dist/windows/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-macos:
+    name: macOS universal tarball
+    needs: [metadata, test]
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      APP_VERSION: ${{ needs.metadata.outputs.app_version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build macOS package
+        shell: bash
+        run: bash ./scripts/package-macos.sh
+      - name: Verify macOS checksum
+        shell: bash
+        working-directory: dist/macos
+        run: shasum -a 256 --check *.sha256
+      - name: Upload macOS package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: odrfid-io-macos-universal
+          path: dist/macos/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [metadata, build-linux, build-windows, build-macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: odrfid-io-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify packages and write manifests
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.metadata.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          checksums=(release-assets/*.sha256)
+          packages=(release-assets/*.tar.gz release-assets/*.zip)
+          if ((${#checksums[@]} != 3 || ${#packages[@]} != 3)); then
+            echo "Expected three packages and three checksums" >&2
+            exit 1
+          fi
+          (
+            cd release-assets
+            for checksum in *.sha256; do
+              sha256sum --check --strict "$checksum"
+            done
+            cat -- *.sha256 | LC_ALL=C sort -k2 > odrfid-io-SHA256SUMS.txt
+          )
+          printf 'odrfid-io %s\nGit commit: %s\n' \
+            "$APP_VERSION" "$GITHUB_SHA" > release-assets/odrfid-io-version.txt
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ needs.metadata.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if ((${#assets[@]} != 8)); then
+            echo "Expected eight release assets; found ${#assets[@]}" >&2
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --generate-notes --title "odrfid-io $APP_VERSION"
+          fi
